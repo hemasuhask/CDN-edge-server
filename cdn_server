@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+import sys
+import socket
+import threading
+import ssl
+from queue import Queue
+
+
+# cdn_port = 4445
+# origin_domain = 'cs.duke.edu'
+# origin_addr = '152.3.103.25'
+# origin_port = 443
+
+cdn_port = int(sys.argv[2])
+origin_domain = sys.argv[4]
+origin_addr = sys.argv[6]
+origin_port = int(sys.argv[8])
+   
+HOST = origin_domain
+PORT = cdn_port
+
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+context.load_cert_chain(certfile="./certs/cdn_cert.pem", keyfile="./certs/cdn_key.pem")
+
+soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+soc.bind((HOST, PORT))
+soc.listen(9)
+print('Socket listening on port', PORT)
+
+connection_pool = Queue(maxsize=10)
+cache = {}
+
+def get_connection(origin_host, origin_port):
+    while not connection_pool.empty():
+        try:
+            conn = connection_pool.get_nowait()
+            conn.send(b"") 
+            break
+            #return conn
+        except Exception:
+            pass
+    
+    conn = socket.create_connection((origin_host, origin_port))
+    return ssl.wrap_socket(conn)
+
+def release_connection(conn):
+    try:
+        connection_pool.put_nowait(conn)
+    except Exception:
+        conn.close()
+
+def client_to_server(source, dest):
+    source.settimeout(3)
+    try:
+        while True:
+            data_chunks = []
+            chunk = source.recv(1024)
+            data_chunks.append(chunk)
+            while len(chunk) == 1024:
+                chunk = source.recv(1024)
+                if not chunk:
+                    break
+                data_chunks.append(chunk)
+            
+            data = b"".join(data_chunks)
+            if not data:
+                source.close()
+                return
+            
+            # Ensure Connection: keep-alive
+            if b"Connection:" in data:
+                data = data.replace(b"Connection: close", b"Connection: keep-alive")
+            else:
+                header_end = data.find(b"\r\n")
+                if header_end != -1:
+                    data = data[:header_end] + b"\r\nConnection: keep-alive" + data[header_end:]
+
+
+            index = data.find(b'HTTP')
+            print(data[:index], file=sys.stderr)
+
+            data = data.replace(b"Connection: close", b"Connection: keep-alive")
+            dest.sendall(data)
+
+    except:
+        source.close()
+        return
+
+def server_to_client(source, dest):
+    source.settimeout(3)
+    try:
+        while True:
+            chunk = source.recv(1024)
+            if chunk.find(b'Cache-Control') > -1:
+                print("TRUE CC", file=sys.stderr)
+            if chunk.find(b'no-store') > -1:
+                print("TRUE no-store", file=sys.stderr)
+            if not chunk:
+                source.close()
+                return
+
+            dest.sendall(chunk)
+            while len(chunk) == 1024:
+                chunk = source.recv(1024)
+                if not chunk:
+                    break
+
+                dest.sendall(chunk)
+                
+            
+    except:
+        source.close()
+        return
+
+def handle_new(conn, address):
+    ssl_client_conn = context.wrap_socket(conn, server_side=True)
+
+    try:
+        origin_socket = get_connection(origin_addr, origin_port)
+        client_thread = threading.Thread(target=client_to_server, args=(ssl_client_conn, origin_socket))
+        client_thread.start()
+        server_thread = threading.Thread(target=server_to_client, args=(origin_socket, ssl_client_conn))
+        server_thread.start()
+
+    finally:
+        release_connection(origin_socket)
+
+
+
+while True:
+    conn, address = soc.accept()
+    threading.Thread(target=handle_new, args=(conn, address)).start()
